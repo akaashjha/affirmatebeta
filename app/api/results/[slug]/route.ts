@@ -1,10 +1,30 @@
 import { NextResponse } from "next/server";
-import { supabase } from "@/lib/supabase";
+import { supabaseAnon, supabaseService } from "@/lib/supabase";
 import OpenAI from "openai";
+
+export const runtime = "nodejs";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function getSlug(req: Request, context: any): string | null {
+type RouteContext = { params: { slug: string } };
+
+type HistogramRow = {
+  adjective_id: string;
+  word: string;
+  category: string | null;
+  count: number | string;
+};
+
+type Candidate = {
+  id: string;
+  word: string;
+  category: string | null;
+  count: number;
+};
+
+type LlmSelected = { selected: string[] };
+
+function getSlug(req: Request, context: RouteContext): string | null {
   const fromParams = context?.params?.slug;
   if (typeof fromParams === "string" && fromParams.length > 0) return fromParams;
 
@@ -15,48 +35,50 @@ function getSlug(req: Request, context: any): string | null {
   return last;
 }
 
-export async function GET(req: Request, context: any) {
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr));
+}
+
+export async function GET(req: Request, context: RouteContext) {
   const slug = getSlug(req, context);
+  if (!slug) return NextResponse.json({ error: "Missing slug" }, { status: 400 });
 
-  if (!slug) {
-    return NextResponse.json({ error: "Missing slug" }, { status: 400 });
-  }
-
-  // 1) Fetch profile
-  const { data: profile } = await supabase
+  // 1) Fetch profile (public read)
+  const { data: profile, error: profErr } = await supabaseAnon
     .from("profiles")
     .select("id, name, slug")
     .eq("slug", slug)
     .single();
 
-  if (!profile) {
-    return NextResponse.json({ error: "Profile not found" }, { status: 404 });
-  }
+  if (profErr) return NextResponse.json({ error: profErr.message }, { status: 500 });
+  if (!profile) return NextResponse.json({ error: "Profile not found" }, { status: 404 });
 
-  // 2) Count submissions
-  const { count: submissionCount } = await supabase
+  // 2) Count submissions (public read)
+  const { count: submissionCount, error: countErr } = await supabaseAnon
     .from("submissions")
     .select("*", { count: "exact", head: true })
     .eq("profile_id", profile.id);
 
+  if (countErr) return NextResponse.json({ error: countErr.message }, { status: 500 });
+
   const totalSubmissions = submissionCount ?? 0;
 
-  // 3) Check cache
-  const { data: cache } = await supabase
+  // 3) Check cache (public read)
+  const { data: cache, error: cacheErr } = await supabaseAnon
     .from("profile_top3_cache")
-    .select("*")
+    .select("profile_id, top3_ids, submission_count_at_compute, updated_at")
     .eq("profile_id", profile.id)
-    .single();
+    .maybeSingle();
 
-  if (
-    cache &&
-    cache.submission_count_at_compute === totalSubmissions
-  ) {
-    // return cached result
-    const { data: words } = await supabase
+  if (cacheErr) return NextResponse.json({ error: cacheErr.message }, { status: 500 });
+
+  if (cache && cache.submission_count_at_compute === totalSubmissions) {
+    const { data: words, error: wordsErr } = await supabaseAnon
       .from("adjectives")
       .select("id, word, category")
       .in("id", cache.top3_ids);
+
+    if (wordsErr) return NextResponse.json({ error: wordsErr.message }, { status: 500 });
 
     return NextResponse.json({
       profile,
@@ -66,28 +88,34 @@ export async function GET(req: Request, context: any) {
     });
   }
 
-  // 4) Get histogram
-  const { data: histogram } = await supabase.rpc("get_profile_histogram", {
+  // If nothing submitted yet, return empty
+  if (totalSubmissions === 0) {
+    return NextResponse.json({ profile, totalSubmissions, top3: [], cached: false });
+  }
+
+  // 4) Get histogram (public read via RPC)
+  const { data: histogram, error: histErr } = await supabaseAnon.rpc("get_profile_histogram", {
     profile_id_input: profile.id,
   });
 
-  const candidates = (histogram ?? [])
-    .map((r: any) => ({
+  if (histErr) return NextResponse.json({ error: histErr.message }, { status: 500 });
+
+  const candidates: Candidate[] = ((histogram ?? []) as HistogramRow[])
+    .map((r) => ({
       id: String(r.adjective_id),
       word: String(r.word),
-      category: r.category,
+      category: r.category ?? null,
       count: Number(r.count),
     }))
     .slice(0, 60);
 
   if (candidates.length === 0) {
-    return NextResponse.json({
-      profile,
-      totalSubmissions,
-      top3: [],
-    });
+    return NextResponse.json({ profile, totalSubmissions, top3: [], cached: false });
   }
 
+  const candidateIdSet = new Set(candidates.map((c) => c.id));
+
+  // 5) LLM select
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0,
@@ -96,43 +124,59 @@ export async function GET(req: Request, context: any) {
       {
         role: "system",
         content:
-          'Pick exactly 3 UNIQUE adjective ids from the provided candidates that best summarize the entire distribution. Return JSON only as {"selected":["id1","id2","id3"]}.',
+          'Pick exactly 3 UNIQUE adjective ids from the provided candidates. IDs must be from the candidate list. Return JSON only as {"selected":["id1","id2","id3"]}.',
       },
-      {
-        role: "user",
-        content: JSON.stringify({
-          totalSubmissions,
-          candidates,
-        }),
-      },
+      { role: "user", content: JSON.stringify({ totalSubmissions, candidates }) },
     ],
   });
 
-  let parsed: any;
+  let parsed: LlmSelected | null = null;
   try {
-    parsed = JSON.parse(completion.choices[0]?.message?.content ?? "null");
+    parsed = JSON.parse(completion.choices[0]?.message?.content ?? "null") as LlmSelected;
   } catch {
-    return NextResponse.json({ error: "LLM invalid JSON" }, { status: 500 });
+    parsed = null;
   }
 
-  const selectedIds: string[] = parsed?.selected;
+  const selectedIdsRaw = Array.isArray(parsed?.selected)
+    ? parsed!.selected.map(String)
+    : [];
 
-  if (!Array.isArray(selectedIds) || selectedIds.length !== 3) {
-    return NextResponse.json({ error: "LLM did not return 3 ids" }, { status: 500 });
+  const cleaned = uniq(selectedIdsRaw);
+  const valid = cleaned.length === 3 && cleaned.every((id) => candidateIdSet.has(id));
+
+  // Fallback deterministic if invalid
+  const finalIds = valid
+    ? cleaned
+    : candidates
+        .slice()
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 3)
+        .map((c) => c.id);
+
+  // 6) Cache result (service role only)
+  if (!supabaseService) {
+    return NextResponse.json(
+      { error: "Server cache client not configured (SUPABASE_SERVICE_ROLE_KEY missing)" },
+      { status: 500 }
+    );
   }
 
-  // 5) Cache result
-  await supabase.from("profile_top3_cache").upsert({
+  const { error: upsertErr } = await supabaseService.from("profile_top3_cache").upsert({
     profile_id: profile.id,
-    top3_ids: selectedIds,
+    top3_ids: finalIds,
     submission_count_at_compute: totalSubmissions,
     updated_at: new Date().toISOString(),
   });
 
-  const { data: words } = await supabase
+  if (upsertErr) return NextResponse.json({ error: upsertErr.message }, { status: 500 });
+
+  // 7) Return words (public read)
+  const { data: words, error: wordsErr } = await supabaseAnon
     .from("adjectives")
     .select("id, word, category")
-    .in("id", selectedIds);
+    .in("id", finalIds);
+
+  if (wordsErr) return NextResponse.json({ error: wordsErr.message }, { status: 500 });
 
   return NextResponse.json({
     profile,
@@ -141,4 +185,3 @@ export async function GET(req: Request, context: any) {
     cached: false,
   });
 }
-
